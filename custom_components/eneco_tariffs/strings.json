@@ -1,0 +1,21 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Eneco Dynamic Tariffs",
+        "description": "Enter your Eneco (Mijn Eneco) login credentials.",
+        "data": {
+          "username": "Email address",
+          "password": "Password"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "Invalid credentials. Check your email and password.",
+      "cannot_connect": "Unable to connect to Eneco. Please try again later."
+    },
+    "abort": {
+      "already_configured": "This Eneco account is already configured."
+    }
+  }
+}

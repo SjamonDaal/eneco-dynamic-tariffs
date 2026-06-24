@@ -1,0 +1,21 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Eneco Dynamische Tarieven",
+        "description": "Voer je Eneco (Mijn Eneco) inloggegevens in.",
+        "data": {
+          "username": "E-mailadres",
+          "password": "Wachtwoord"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "Ongeldige inloggegevens. Controleer je e-mailadres en wachtwoord.",
+      "cannot_connect": "Kan geen verbinding maken met Eneco. Probeer het later opnieuw."
+    },
+    "abort": {
+      "already_configured": "Dit Eneco-account is al geconfigureerd."
+    }
+  }
+}
