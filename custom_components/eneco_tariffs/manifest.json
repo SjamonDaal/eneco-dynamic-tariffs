@@ -2,12 +2,12 @@
   "domain": "eneco_tariffs",
   "name": "Eneco Dynamic Tariffs",
   "version": "1.0.0",
-  "documentation": "https://github.com/dstaal/hacs-eneco-tariffs",
-  "issue_tracker": "https://github.com/dstaal/hacs-eneco-tariffs/issues",
+  "documentation": "https://github.com/SjamonDaal/eneco-dynamic-tariffs",
+  "issue_tracker": "https://github.com/SjamonDaal/eneco-dynamic-tariffs/issues",
   "dependencies": [],
-  "codeowners": ["@dstaal"],
+  "codeowners": ["@SjamonDaal"],
   "requirements": [],
   "iot_class": "cloud_polling",
   "config_flow": true,
-  "homeassistant": "2023.1.0"
+  "homeassistant": "2024.1.0"
 }
