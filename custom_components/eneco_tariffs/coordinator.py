@@ -135,7 +135,7 @@ class EnecoApiClient:
         for field in form.get("value", []):
             name = field.get("name", "")
             is_secret = field.get("secret", False)
-            if name == "credentials" and is_secret:
+            if name == "credentials":
                 post[name] = {"passcode": code}
             elif "value" in field and not is_secret:
                 post[name] = field["value"]
@@ -210,7 +210,7 @@ class EnecoApiClient:
 
                 if name == "identifier":
                     post[name] = username
-                elif name == "credentials" and is_secret:
+                elif name == "credentials":
                     if password_submitted:
                         # A second credentials challenge after password = email TOTP
                         _LOGGER.warning("Eneco IDX — email TOTP challenge detected at step %d", i)

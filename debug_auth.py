@@ -66,9 +66,10 @@ def show_state(state: dict, step: int) -> None:
 
 
 async def main() -> None:
+    import os
     print("Eneco authentication debug script")
-    username = input("Email address: ")
-    password = getpass.getpass("Password: ")
+    username = os.environ.get("ENECO_USER") or input("Email address: ")
+    password = os.environ.get("ENECO_PASS") or getpass.getpass("Password: ")
 
     async with aiohttp.ClientSession(cookie_jar=aiohttp.CookieJar()) as session:
 
@@ -173,7 +174,7 @@ async def main() -> None:
 
             if totp_needed:
                 print("\n  *** Email TOTP challenge detected ***")
-                totp_code = input("  Enter the code from your email: ").strip()
+                totp_code = (os.environ.get("ENECO_TOTP") or input("  Enter the code from your email: ")).strip()
                 post = {}
                 for field in form.get("value", []):
                     name = field.get("name", "")
