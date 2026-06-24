@@ -294,12 +294,14 @@ class EnecoApiClient:
             return []
         cookies = []
         for cookie in self._session.cookie_jar:
+            # aiohttp CookieJar yields Morsel objects: name is .key,
+            # domain/path are accessed as dict items, not attributes
             cookies.append(
                 {
-                    "name": cookie.name,
+                    "name": cookie.key,
                     "value": cookie.value,
-                    "domain": cookie.domain or "",
-                    "path": cookie.path or "/",
+                    "domain": cookie.get("domain") or "",
+                    "path": cookie.get("path") or "/",
                 }
             )
         return cookies
