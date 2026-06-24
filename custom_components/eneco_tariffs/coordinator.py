@@ -547,15 +547,42 @@ def _parse_tariff_data(raw: dict[str, Any]) -> dict[str, Any]:
     current_entry = _price_entry_at(all_prices, now_utc)
     next_entry = _price_entry_at(all_prices, next_utc)
 
+    # Daily stats from today's prices
+    max_entry = max(prices_today, key=lambda x: x["price"]) if prices_today else None
+    min_entry = min(prices_today, key=lambda x: x["price"]) if prices_today else None
+    max_price = max_entry["price"] if max_entry else None
+    min_price = min_entry["price"] if min_entry else None
+    max_ts = datetime.fromisoformat(max_entry["start"].replace("Z", "+00:00")) if max_entry else None
+    min_ts = datetime.fromisoformat(min_entry["start"].replace("Z", "+00:00")) if min_entry else None
+
+    current_price = current_entry["price"] if current_entry else None
+    pct_of_range: float | None = None
+    pct_of_highest: float | None = None
+    if current_price is not None and max_price is not None and min_price is not None:
+        price_range = max_price - min_price
+        if price_range > 0:
+            pct_of_range = round((current_price - min_price) / price_range * 100, 1)
+        if max_price > 0:
+            pct_of_highest = round(current_price / max_price * 100, 1)
+
     # Gas changes daily — grab the first slice's price
     gas_slices = _extract_dynamic_prices(raw.get("prices_today", {}), "gas")
     gas_price = gas_slices[0]["price"] if gas_slices else _extract_gas_price(raw.get("products", {}))
 
     return {
-        "electricity_current_price": current_entry["price"] if current_entry else None,
+        "electricity_current_price": current_price,
         "electricity_current_rating": current_entry.get("rating") if current_entry else None,
+        "electricity_current_market_price": current_entry.get("market") if current_entry else None,
         "electricity_next_price": next_entry["price"] if next_entry else None,
         "electricity_next_rating": next_entry.get("rating") if next_entry else None,
+        "electricity_next_market_price": next_entry.get("market") if next_entry else None,
+        "electricity_average_price": _get_product_average(raw.get("prices_today", {}), "electricity"),
+        "electricity_highest_price": max_price,
+        "electricity_lowest_price": min_price,
+        "electricity_highest_price_time": max_ts,
+        "electricity_lowest_price_time": min_ts,
+        "electricity_current_pct_of_range": pct_of_range,
+        "electricity_current_pct_of_highest": pct_of_highest,
         "electricity_rate": _extract_electricity_price(raw.get("products", {})),
         "gas_current_price": gas_price,
         "electricity_prices_today": prices_today,
@@ -580,10 +607,25 @@ def _extract_dynamic_prices(
             price_obj = slice_.get("price", {})
             price = _to_float(price_obj.get("total"))
             rating = price_obj.get("rating", "average")
+            market = next(
+                (_to_float(c.get("cost")) for c in price_obj.get("components", []) if c.get("type") == "wholesale"),
+                None,
+            )
             if ts and price is not None:
-                entries.append({"start": ts, "price": round(price, 7), "rating": rating})
+                entry: dict[str, Any] = {"start": ts, "price": round(price, 7), "rating": rating}
+                if market is not None:
+                    entry["market"] = round(market, 7)
+                entries.append(entry)
         return entries
     return []
+
+
+def _get_product_average(data: dict[str, Any], product_type: str = "electricity") -> float | None:
+    """Return the averagePrice field from the product-level response."""
+    for product in data.get("data", {}).get("products", []):
+        if product.get("productType") == product_type:
+            return _to_float(product.get("averagePrice"))
+    return None
 
 
 def _price_entry_at(

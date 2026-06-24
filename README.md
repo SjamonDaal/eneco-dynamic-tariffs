@@ -64,6 +64,35 @@ yaxis:
     decimals: 2
 ```
 
+Tomorrow's prices (available after ~15:00):
+
+```yaml
+type: custom:apexcharts-card
+graph_span: 24h
+span:
+  start: day
+  offset: +1d
+now:
+  show: true
+  label: Nu
+header:
+  show: true
+  title: Stroomprijs morgen (€/kWh)
+series:
+  - entity: sensor.eneco_dynamic_tariffs_electricity_price_current_hour
+    stroke_width: 2
+    float_precision: 3
+    type: column
+    opacity: 1
+    data_generator: |
+      return entity.attributes.prices_tomorrow.map((record) => {
+        return [new Date(record.start).getTime(), record.price];
+      });
+yaxis:
+  - id: Prijs
+    decimals: 2
+```
+
 ## Automations
 
 Example: notify when the next hour is cheap:

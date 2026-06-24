@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 from homeassistant.components.sensor import (
@@ -10,6 +11,7 @@ from homeassistant.components.sensor import (
     SensorStateClass,
 )
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import PERCENTAGE
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -67,6 +69,81 @@ SENSORS: tuple[EnecoSensorEntityDescription, ...] = (
         state_class=SensorStateClass.MEASUREMENT,
         icon="mdi:gas-burner",
     ),
+    EnecoSensorEntityDescription(
+        key="electricity_average_price",
+        data_key="electricity_average_price",
+        name="Electricity Average Price (today)",
+        native_unit_of_measurement="EUR/kWh",
+        device_class=SensorDeviceClass.MONETARY,
+        state_class=SensorStateClass.MEASUREMENT,
+        icon="mdi:lightning-bolt",
+    ),
+    EnecoSensorEntityDescription(
+        key="electricity_current_market_price",
+        data_key="electricity_current_market_price",
+        name="Electricity Market Price (current hour)",
+        native_unit_of_measurement="EUR/kWh",
+        device_class=SensorDeviceClass.MONETARY,
+        state_class=SensorStateClass.MEASUREMENT,
+        icon="mdi:chart-line",
+    ),
+    EnecoSensorEntityDescription(
+        key="electricity_next_market_price",
+        data_key="electricity_next_market_price",
+        name="Electricity Market Price (next hour)",
+        native_unit_of_measurement="EUR/kWh",
+        device_class=SensorDeviceClass.MONETARY,
+        state_class=SensorStateClass.MEASUREMENT,
+        icon="mdi:chart-line-variant",
+    ),
+    EnecoSensorEntityDescription(
+        key="electricity_highest_price",
+        data_key="electricity_highest_price",
+        name="Electricity Highest Price (today)",
+        native_unit_of_measurement="EUR/kWh",
+        device_class=SensorDeviceClass.MONETARY,
+        state_class=SensorStateClass.MEASUREMENT,
+        icon="mdi:arrow-up-bold",
+    ),
+    EnecoSensorEntityDescription(
+        key="electricity_lowest_price",
+        data_key="electricity_lowest_price",
+        name="Electricity Lowest Price (today)",
+        native_unit_of_measurement="EUR/kWh",
+        device_class=SensorDeviceClass.MONETARY,
+        state_class=SensorStateClass.MEASUREMENT,
+        icon="mdi:arrow-down-bold",
+    ),
+    EnecoSensorEntityDescription(
+        key="electricity_current_pct_of_range",
+        data_key="electricity_current_pct_of_range",
+        name="Electricity Price Position in Range",
+        native_unit_of_measurement=PERCENTAGE,
+        state_class=SensorStateClass.MEASUREMENT,
+        icon="mdi:percent",
+    ),
+    EnecoSensorEntityDescription(
+        key="electricity_current_pct_of_highest",
+        data_key="electricity_current_pct_of_highest",
+        name="Electricity Price Percentage of Highest",
+        native_unit_of_measurement=PERCENTAGE,
+        state_class=SensorStateClass.MEASUREMENT,
+        icon="mdi:percent",
+    ),
+    EnecoSensorEntityDescription(
+        key="electricity_highest_price_time",
+        data_key="electricity_highest_price_time",
+        name="Time of Highest Electricity Price",
+        device_class=SensorDeviceClass.TIMESTAMP,
+        icon="mdi:clock-alert",
+    ),
+    EnecoSensorEntityDescription(
+        key="electricity_lowest_price_time",
+        data_key="electricity_lowest_price_time",
+        name="Time of Lowest Electricity Price",
+        device_class=SensorDeviceClass.TIMESTAMP,
+        icon="mdi:clock-check",
+    ),
 )
 
 
@@ -106,12 +183,14 @@ class EnecoSensor(CoordinatorEntity[EnecoCoordinator], SensorEntity):
         )
 
     @property
-    def native_value(self) -> float | None:
+    def native_value(self) -> float | datetime | None:
         if self.coordinator.data is None:
             return None
         value = self.coordinator.data.get(self.entity_description.data_key)
         if value is None:
             return None
+        if isinstance(value, datetime):
+            return value
         try:
             return round(float(value), 5)
         except (TypeError, ValueError):
@@ -130,4 +209,8 @@ class EnecoSensor(CoordinatorEntity[EnecoCoordinator], SensorEntity):
             rating = self.coordinator.data.get(self.entity_description.rating_key)
             if rating:
                 attrs["rating"] = rating
+        if self.entity_description.key == "electricity_current_price":
+            prices_tomorrow = self.coordinator.data.get("electricity_prices_tomorrow")
+            if prices_tomorrow:
+                attrs["prices_tomorrow"] = prices_tomorrow
         return attrs or None
