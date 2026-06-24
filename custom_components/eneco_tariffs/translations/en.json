@@ -15,6 +15,13 @@
         "data": {
           "totp_code": "Verification code"
         }
+      },
+      "reauth_confirm": {
+        "title": "Re-authenticate with Eneco",
+        "description": "The session for {username} has expired. Enter your password to reconnect.",
+        "data": {
+          "password": "Password"
+        }
       }
     },
     "error": {

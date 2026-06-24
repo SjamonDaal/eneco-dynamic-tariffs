@@ -467,7 +467,10 @@ class EnecoCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 _LOGGER.debug("Eneco session restored from stored cookies")
                 self._authenticated = True
                 return
-            _LOGGER.debug("Stored session expired, falling back to full auth")
+            _LOGGER.debug("Stored session expired, clearing cookies and falling back to full auth")
+            # Clear stale cookies so they don't interfere with the Okta login redirect
+            await self._client.close()
+            self._client = EnecoApiClient()
 
         # Full auth — will raise ConfigEntryAuthFailed if TOTP is needed
         # (TOTP must be handled via the config flow, not here)

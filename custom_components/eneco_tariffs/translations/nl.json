@@ -15,6 +15,13 @@
         "data": {
           "totp_code": "Verificatiecode"
         }
+      },
+      "reauth_confirm": {
+        "title": "Opnieuw inloggen bij Eneco",
+        "description": "De sessie voor {username} is verlopen. Voer je wachtwoord in om opnieuw verbinding te maken.",
+        "data": {
+          "password": "Wachtwoord"
+        }
       }
     },
     "error": {

@@ -4,7 +4,7 @@ import logging
 from typing import Any
 
 import voluptuous as vol
-from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
+from homeassistant.config_entries import ConfigEntry, ConfigFlow, ConfigFlowResult
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 
 from .const import CONF_SESSION_COOKIES, DOMAIN
@@ -35,6 +35,51 @@ class EnecoConfigFlow(ConfigFlow, domain=DOMAIN):
         self._client: EnecoApiClient | None = None
         self._username: str = ""
         self._password: str = ""
+        self._reauth_entry: ConfigEntry | None = None
+
+    async def async_step_reauth(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Handle re-authentication when the stored session expires."""
+        self._reauth_entry = self.hass.config_entries.async_get_entry(self.context["entry_id"])
+        if self._reauth_entry:
+            self._username = self._reauth_entry.data.get(CONF_USERNAME, "")
+        return await self.async_step_reauth_confirm()
+
+    async def async_step_reauth_confirm(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        errors: dict[str, str] = {}
+
+        if user_input is not None:
+            password = user_input[CONF_PASSWORD]
+            self._client = EnecoApiClient()
+            self._password = password
+
+            try:
+                await self._client.authenticate(self._username, password)
+            except EnecoTotpRequired:
+                return await self.async_step_totp()
+            except EnecoAuthError as err:
+                _LOGGER.warning("Eneco re-authentication failed: %s", err)
+                errors["base"] = "invalid_auth"
+                await self._client.close()
+                self._client = None
+            except Exception:
+                _LOGGER.exception("Unexpected error during Eneco re-authentication")
+                errors["base"] = "cannot_connect"
+                if self._client:
+                    await self._client.close()
+                    self._client = None
+            else:
+                return await self._create_entry()
+
+        return self.async_show_form(
+            step_id="reauth_confirm",
+            data_schema=vol.Schema({vol.Required(CONF_PASSWORD): str}),
+            description_placeholders={"username": self._username},
+            errors=errors,
+        )
 
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
@@ -105,11 +150,14 @@ class EnecoConfigFlow(ConfigFlow, domain=DOMAIN):
 
     async def _create_entry(self) -> ConfigFlowResult:
         cookies = self._client.get_session_cookies() if self._client else []  # type: ignore[union-attr]
+        data = {
+            CONF_USERNAME: self._username,
+            CONF_PASSWORD: self._password,
+            CONF_SESSION_COOKIES: cookies,
+        }
+        if self._reauth_entry:
+            return self.async_update_reload_and_abort(self._reauth_entry, data=data)
         return self.async_create_entry(
             title=f"Eneco ({self._username})",
-            data={
-                CONF_USERNAME: self._username,
-                CONF_PASSWORD: self._password,
-                CONF_SESSION_COOKIES: cookies,
-            },
+            data=data,
         )
