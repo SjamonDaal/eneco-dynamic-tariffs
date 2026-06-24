@@ -7,19 +7,32 @@ from datetime import datetime, timedelta
 from typing import Any
 
 import aiohttp
+from yarl import URL
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
-from .const import API_BASE, API_KEY, DOMAIN, ENECO_WEB_BASE, OKTA_BASE, UPDATE_INTERVAL_MINUTES
+from .const import (
+    API_BASE,
+    API_KEY,
+    CONF_SESSION_COOKIES,
+    DOMAIN,
+    ENECO_WEB_BASE,
+    OKTA_BASE,
+    UPDATE_INTERVAL_MINUTES,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
 
 class EnecoAuthError(Exception):
     """Raised when Eneco authentication fails."""
+
+
+class EnecoTotpRequired(Exception):
+    """Raised when Okta requires an email TOTP code to continue."""
 
 
 class EnecoApiClient:
@@ -30,6 +43,7 @@ class EnecoApiClient:
         self._token: str | None = None
         self._customer_id: str | None = None
         self._account_id: str | None = None
+        self._pending_totp_state: dict[str, Any] | None = None
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -47,22 +61,27 @@ class EnecoApiClient:
             headers["Authorization"] = f"Bearer {self._token}"
         return headers
 
+    # ------------------------------------------------------------------
+    # Authentication
+    # ------------------------------------------------------------------
+
     async def authenticate(self, username: str, password: str) -> None:
-        """Authenticate against Eneco via NextAuth + Okta IDX flow."""
+        """Start Okta authentication.
+
+        Raises EnecoTotpRequired when Eneco asks for an email TOTP code.
+        The caller must then invoke complete_totp() with the received code.
+        """
         session = await self._get_session()
 
-        # Load the protected page to seed cookies
         async with session.get(f"{ENECO_WEB_BASE}/mijn-eneco/") as resp:
             await resp.read()
 
-        # Obtain NextAuth CSRF token
         async with session.get(f"{ENECO_WEB_BASE}/api/auth/csrf/") as resp:
             csrf_data = await resp.json(content_type=None)
         csrf_token = csrf_data.get("csrfToken")
         if not csrf_token:
             raise EnecoAuthError("Could not obtain CSRF token from Eneco")
 
-        # Tell NextAuth to sign in via Okta; receive the Okta redirect URL
         async with session.post(
             f"{ENECO_WEB_BASE}/api/auth/signin/okta/",
             data={
@@ -76,73 +95,101 @@ class EnecoApiClient:
         if not okta_url:
             raise EnecoAuthError("No Okta redirect URL received from NextAuth")
 
-        # Load the Okta login page and extract the stateToken embedded in the HTML
         async with session.get(okta_url) as resp:
             okta_html = await resp.text()
+
         m = re.search(r'"stateToken"\s*:\s*"(.*?)"', okta_html)
         if not m:
             raise EnecoAuthError("Okta stateToken not found in login page HTML")
-        # Unescape unicode escape sequences Okta embeds (e.g. \x2D → -)
-        state_token = m.group(1).encode("utf-8").decode("unicode_escape")
+        # Okta embeds the token as a JSON string — decode escape sequences
+        state_token = _unescape_okta_string(m.group(1))
 
-        # Begin the Okta IDX remediation loop
         state = await self._post_json(
             session,
             f"{OKTA_BASE}/idp/idx/introspect",
             {"stateToken": state_token},
         )
+
+        # May raise EnecoTotpRequired — caller handles it
         state = await self._run_auth_loop(session, state, username, password)
+        await self._finalise_auth(session, state)
 
-        # Follow the success URL to pick up the ID token and account identifiers
-        success_href = state.get("success", {}).get("href")
-        if not success_href:
-            raise EnecoAuthError("Okta authentication succeeded but no success URL was returned")
+    async def complete_totp(self, code: str) -> None:
+        """Submit the email TOTP code to finish a paused authentication."""
+        if self._pending_totp_state is None:
+            raise EnecoAuthError("No pending TOTP challenge — call authenticate() first")
 
-        async with session.get(success_href) as resp:
-            success_html = await resp.text()
+        session = await self._get_session()
+        state = self._pending_totp_state
 
-        if m := re.search(r'"idToken"\s*:\s*"(.*?)"', success_html):
-            self._token = m.group(1)
-        if m := re.search(r'"customerId"\s*:\s*(\d+)', success_html):
-            self._customer_id = m.group(1)
-        if m := re.search(r'"accountId"\s*:\s*(\d+)', success_html):
-            self._account_id = m.group(1)
+        remediations = state.get("remediation", {}).get("value", [])
+        if not remediations:
+            raise EnecoAuthError("Pending TOTP state has no remediation form")
 
-        if not self._token:
-            raise EnecoAuthError("ID token not found in post-authentication response")
-        if not self._customer_id or not self._account_id:
-            raise EnecoAuthError("Customer/account IDs not found in post-authentication response")
+        form = remediations[0]
+        href = form.get("href")
+        if not href:
+            raise EnecoAuthError("TOTP remediation form has no action URL")
 
-        _LOGGER.debug(
-            "Eneco authentication successful (customer=%s, account=%s)",
-            self._customer_id,
-            self._account_id,
-        )
+        post: dict[str, Any] = {}
+        for field in form.get("value", []):
+            name = field.get("name", "")
+            is_secret = field.get("secret", False)
+            if name == "credentials" and is_secret:
+                post[name] = {"passcode": code}
+            elif "value" in field and not is_secret:
+                post[name] = field["value"]
+
+        _LOGGER.debug("Submitting TOTP code to %s", href)
+        state = await self._post_json(session, href, post)
+
+        # There should be no more remediations after a correct TOTP code
+        if "success" not in state:
+            # One more loop iteration in case Okta adds a step
+            state = await self._run_auth_loop(session, state, "", "")
+
+        self._pending_totp_state = None
+        await self._finalise_auth(session, state)
 
     async def _run_auth_loop(
         self,
         session: aiohttp.ClientSession,
-        state: dict[str, Any],
+        initial_state: dict[str, Any],
         username: str,
         password: str,
     ) -> dict[str, Any]:
-        """Walk through the Okta IDX remediation steps until success or error."""
-        for _ in range(10):
+        """Walk through Okta IDX remediation steps; detect TOTP challenge."""
+        state = initial_state
+        password_submitted = False
+
+        for i in range(15):
+            _LOGGER.debug("IDX step %d — keys: %s", i, list(state.keys()))
+            _LOGGER.debug("IDX step %d — full state: %s", i, state)
+
             if "success" in state:
                 return state
 
+            # Log any inline messages (e.g. wrong password)
+            for msg in state.get("messages", {}).get("value", []):
+                _LOGGER.warning("Okta message: %s", msg.get("message", msg))
+
             remediations = state.get("remediation", {}).get("value", [])
             if not remediations:
-                messages = state.get("messages", {}).get("value", [])
-                detail = messages[0].get("message", "unknown") if messages else "no remediations"
+                msgs = state.get("messages", {}).get("value", [])
+                detail = msgs[0].get("message", "unknown") if msgs else "no remediations"
                 raise EnecoAuthError(f"Okta authentication blocked: {detail}")
 
             form = remediations[0]
+            form_name = form.get("name", "")
             href = form.get("href")
+            _LOGGER.debug("IDX step %d — form '%s' → %s", i, form_name, href)
+
             if not href:
-                raise EnecoAuthError("Okta remediation form has no action URL")
+                raise EnecoAuthError(f"Okta form '{form_name}' has no action URL")
 
             post: dict[str, Any] = {}
+            totp_needed = False
+
             for field in form.get("value", []):
                 name = field.get("name", "")
                 is_secret = field.get("secret", False)
@@ -150,9 +197,14 @@ class EnecoApiClient:
                 if name == "identifier":
                     post[name] = username
                 elif name == "credentials" and is_secret:
+                    if password_submitted:
+                        # A second credentials challenge is the email TOTP step
+                        _LOGGER.debug("IDX — email TOTP challenge detected at step %d", i)
+                        totp_needed = True
+                        break
                     post[name] = {"passcode": password}
+                    password_submitted = True
                 elif name == "authenticator":
-                    # Select the password authenticator when asked to choose
                     options = field.get("options", [])
                     chosen = next(
                         (
@@ -168,25 +220,118 @@ class EnecoApiClient:
                 elif "value" in field and not is_secret:
                     post[name] = field["value"]
 
+            if totp_needed:
+                self._pending_totp_state = state
+                raise EnecoTotpRequired()
+
+            _LOGGER.debug("IDX step %d — posting keys: %s", i, list(post.keys()))
             state = await self._post_json(session, href, post)
 
         raise EnecoAuthError("Okta IDX loop exceeded maximum iterations")
 
-    @staticmethod
-    async def _post_json(
-        session: aiohttp.ClientSession,
-        url: str,
-        payload: dict[str, Any],
-    ) -> dict[str, Any]:
-        async with session.post(
-            url,
-            data=json.dumps(payload),
-            headers={"Content-Type": "application/json"},
-        ) as resp:
-            return await resp.json(content_type=None)
+    async def _finalise_auth(
+        self, session: aiohttp.ClientSession, state: dict[str, Any]
+    ) -> None:
+        """Follow the success URL and extract the ID token + account IDs."""
+        success_href = state.get("success", {}).get("href")
+        if not success_href:
+            raise EnecoAuthError("Okta success state has no href")
+
+        async with session.get(success_href) as resp:
+            success_html = await resp.text()
+
+        _LOGGER.debug("Post-auth page length: %d chars", len(success_html))
+
+        if m := re.search(r'"idToken"\s*:\s*"(.*?)"', success_html):
+            self._token = m.group(1)
+        if m := re.search(r'"customerId"\s*:\s*(\d+)', success_html):
+            self._customer_id = m.group(1)
+        if m := re.search(r'"accountId"\s*:\s*(\d+)', success_html):
+            self._account_id = m.group(1)
+
+        if not self._token:
+            raise EnecoAuthError("idToken not found in post-authentication page")
+        if not self._customer_id or not self._account_id:
+            raise EnecoAuthError("Customer/account IDs not found in post-authentication page")
+
+        _LOGGER.debug(
+            "Authenticated — customer=%s account=%s",
+            self._customer_id,
+            self._account_id,
+        )
+
+    # ------------------------------------------------------------------
+    # Session-cookie persistence (avoids repeated TOTP on restart)
+    # ------------------------------------------------------------------
+
+    def get_session_cookies(self) -> list[dict[str, str]]:
+        """Return current session cookies as a JSON-serialisable list."""
+        if not self._session or self._session.closed:
+            return []
+        cookies = []
+        for cookie in self._session.cookie_jar:
+            cookies.append(
+                {
+                    "name": cookie.name,
+                    "value": cookie.value,
+                    "domain": cookie.domain or "",
+                    "path": cookie.path or "/",
+                }
+            )
+        return cookies
+
+    async def restore_session_cookies(self, cookies: list[dict[str, str]]) -> None:
+        """Load stored cookies into the session jar."""
+        session = await self._get_session()
+        for c in cookies:
+            domain = c.get("domain", "").lstrip(".")
+            if domain:
+                url = URL(f"https://{domain}/")
+                session.cookie_jar.update_cookies({c["name"]: c["value"]}, url)
+
+    async def refresh_token_from_session(self) -> bool:
+        """Obtain a fresh idToken from the NextAuth session endpoint.
+
+        Returns True if the stored session is still valid and credentials were
+        successfully refreshed without requiring TOTP.
+        """
+        session = await self._get_session()
+        try:
+            async with session.get(f"{ENECO_WEB_BASE}/api/auth/session") as resp:
+                if resp.status != 200:
+                    _LOGGER.debug("Session endpoint returned %d", resp.status)
+                    return False
+                data = await resp.json(content_type=None)
+
+            _LOGGER.debug("NextAuth session response: %s", data)
+
+            id_token = (
+                data.get("idToken")
+                or data.get("accessToken")
+                or data.get("user", {}).get("idToken")
+            )
+            if not id_token:
+                return False
+
+            self._token = id_token
+
+            data_str = str(data)
+            if m := re.search(r'"customerId"\s*:\s*(\d+)', data_str):
+                self._customer_id = m.group(1)
+            if m := re.search(r'"accountId"\s*:\s*(\d+)', data_str):
+                self._account_id = m.group(1)
+
+            return bool(self._token and self._customer_id and self._account_id)
+
+        except Exception as err:
+            _LOGGER.debug("Session refresh failed: %s", err)
+            return False
+
+    # ------------------------------------------------------------------
+    # Data endpoints
+    # ------------------------------------------------------------------
 
     async def get_products(self) -> dict[str, Any]:
-        """Retrieve account products including current tariff rates."""
         session = await self._get_session()
         url = (
             f"{API_BASE}/dxpweb/v2/nl/eneco/customers/{self._customer_id}"
@@ -199,12 +344,8 @@ class EnecoApiClient:
             return await resp.json(content_type=None)
 
     async def get_usages(
-        self,
-        start: str,
-        aggregation: str = "Day",
-        interval: str = "Hour",
+        self, start: str, aggregation: str = "Day", interval: str = "Hour"
     ) -> dict[str, Any]:
-        """Retrieve hourly usage data for a given start date (YYYY-MM-DD)."""
         session = await self._get_session()
         params = {
             "aggregation": aggregation,
@@ -225,7 +366,6 @@ class EnecoApiClient:
             return await resp.json(content_type=None)
 
     async def get_insights(self) -> dict[str, Any]:
-        """Retrieve usage insights for the account."""
         session = await self._get_session()
         url = (
             f"{API_BASE}/dxpweb/v2/nl/eneco/customers/{self._customer_id}"
@@ -237,9 +377,27 @@ class EnecoApiClient:
             resp.raise_for_status()
             return await resp.json(content_type=None)
 
+    @staticmethod
+    async def _post_json(
+        session: aiohttp.ClientSession,
+        url: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        async with session.post(
+            url,
+            data=json.dumps(payload),
+            headers={"Content-Type": "application/json"},
+        ) as resp:
+            return await resp.json(content_type=None)
+
+
+# ------------------------------------------------------------------
+# Coordinator
+# ------------------------------------------------------------------
+
 
 class EnecoCoordinator(DataUpdateCoordinator[dict[str, Any]]):
-    """Manages periodic data updates for the Eneco integration."""
+    """Manages periodic Eneco tariff data updates."""
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
         super().__init__(
@@ -256,16 +414,15 @@ class EnecoCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         try:
             if not self._authenticated:
                 await self._authenticate()
-
             return await self._fetch_data()
 
         except EnecoAuthError as err:
             self._authenticated = False
-            _LOGGER.debug("Auth error during update, retrying once: %s", err)
+            _LOGGER.debug("Auth error, retrying: %s", err)
             try:
                 await self._authenticate()
                 return await self._fetch_data()
-            except EnecoAuthError as retry_err:
+            except (EnecoAuthError, EnecoTotpRequired) as retry_err:
                 raise ConfigEntryAuthFailed(str(retry_err)) from retry_err
 
         except ConfigEntryAuthFailed:
@@ -275,21 +432,48 @@ class EnecoCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             raise UpdateFailed(f"Error communicating with Eneco: {err}") from err
 
     async def _authenticate(self) -> None:
-        await self._client.authenticate(
-            self.entry.data[CONF_USERNAME],
-            self.entry.data[CONF_PASSWORD],
-        )
+        """Authenticate, preferring stored session cookies over full re-auth."""
+        stored_cookies: list[dict] = self.entry.data.get(CONF_SESSION_COOKIES, [])
+
+        if stored_cookies:
+            await self._client.restore_session_cookies(stored_cookies)
+            if await self._client.refresh_token_from_session():
+                _LOGGER.debug("Eneco session restored from stored cookies")
+                self._authenticated = True
+                return
+            _LOGGER.debug("Stored session expired, falling back to full auth")
+
+        # Full auth — will raise ConfigEntryAuthFailed if TOTP is needed
+        # (TOTP must be handled via the config flow, not here)
+        try:
+            await self._client.authenticate(
+                self.entry.data[CONF_USERNAME],
+                self.entry.data[CONF_PASSWORD],
+            )
+        except EnecoTotpRequired as err:
+            raise ConfigEntryAuthFailed(
+                "Eneco requires email verification. Please re-configure the integration."
+            ) from err
+
         self._authenticated = True
+        await self._save_cookies()
+
+    async def _save_cookies(self) -> None:
+        cookies = self._client.get_session_cookies()
+        if cookies:
+            self.hass.config_entries.async_update_entry(
+                self.entry,
+                data={**self.entry.data, CONF_SESSION_COOKIES: cookies},
+            )
 
     async def _fetch_data(self) -> dict[str, Any]:
         today = datetime.now().strftime("%Y-%m-%d")
         tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
-
         raw: dict[str, Any] = {}
 
         try:
             raw["products"] = await self._client.get_products()
-            _LOGGER.debug("Eneco products response: %s", raw["products"])
+            _LOGGER.debug("Eneco products: %s", raw["products"])
         except EnecoAuthError:
             raise
         except Exception as err:
@@ -297,15 +481,15 @@ class EnecoCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         try:
             raw["usages_today"] = await self._client.get_usages(today)
-            _LOGGER.debug("Eneco usages (today): %s", raw["usages_today"])
+            _LOGGER.debug("Eneco usages today: %s", raw["usages_today"])
         except EnecoAuthError:
             raise
         except Exception as err:
-            _LOGGER.warning("Failed to fetch Eneco usages for today: %s", err)
+            _LOGGER.warning("Failed to fetch Eneco usages (today): %s", err)
 
         try:
             raw["usages_tomorrow"] = await self._client.get_usages(tomorrow)
-            _LOGGER.debug("Eneco usages (tomorrow): %s", raw["usages_tomorrow"])
+            _LOGGER.debug("Eneco usages tomorrow: %s", raw["usages_tomorrow"])
         except EnecoAuthError:
             raise
         except Exception as err:
@@ -326,75 +510,60 @@ class EnecoCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         await super().async_shutdown()
 
 
+# ------------------------------------------------------------------
+# Data parsing helpers
+# ------------------------------------------------------------------
+
+
 def _parse_tariff_data(raw: dict[str, Any]) -> dict[str, Any]:
-    """Transform raw API responses into a flat tariff data dict used by sensors."""
     now = datetime.now().astimezone()
-    current_hour_str = now.replace(minute=0, second=0, microsecond=0).isoformat()
-    next_hour_str = (now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)).isoformat()
+    current_hour = now.replace(minute=0, second=0, microsecond=0)
+    next_hour = current_hour + timedelta(hours=1)
 
-    electricity_prices_today = _extract_hourly_prices(raw.get("usages_today", {}))
-    electricity_prices_tomorrow = _extract_hourly_prices(raw.get("usages_tomorrow", {}))
-
-    current_price = _price_at(electricity_prices_today, current_hour_str)
-    next_price = _price_at(electricity_prices_today, next_hour_str) or _price_at(
-        electricity_prices_tomorrow, next_hour_str
-    )
-
-    gas_price = _extract_gas_price(raw.get("products", {}))
-    electricity_price_from_products = _extract_electricity_price(raw.get("products", {}))
+    prices_today = _extract_hourly_prices(raw.get("usages_today", {}))
+    prices_tomorrow = _extract_hourly_prices(raw.get("usages_tomorrow", {}))
 
     return {
-        "electricity_current_price": current_price,
-        "electricity_next_price": next_price,
-        # Fallback to products rate when no hourly usage data exists
-        "electricity_rate": electricity_price_from_products,
-        "gas_current_price": gas_price,
-        "electricity_prices_today": electricity_prices_today,
-        "electricity_prices_tomorrow": electricity_prices_tomorrow,
+        "electricity_current_price": _price_at(prices_today, current_hour.isoformat()),
+        "electricity_next_price": (
+            _price_at(prices_today, next_hour.isoformat())
+            or _price_at(prices_tomorrow, next_hour.isoformat())
+        ),
+        "electricity_rate": _extract_electricity_price(raw.get("products", {})),
+        "gas_current_price": _extract_gas_price(raw.get("products", {})),
+        "electricity_prices_today": prices_today,
+        "electricity_prices_tomorrow": prices_tomorrow,
         "raw": raw,
     }
 
 
 def _extract_hourly_prices(usages: dict[str, Any]) -> list[dict[str, Any]]:
-    """Extract a list of {start, price} dicts from a usages API response.
-
-    The exact response structure is determined at runtime; this function
-    attempts common key patterns seen in Eneco's DXP API responses.
-    """
-    entries: list[dict[str, Any]] = []
-
-    # Try top-level list keys
     rows: list[Any] = []
     for key in ("data", "usages", "measurements", "values", "items"):
         candidate = usages.get(key)
         if isinstance(candidate, list):
             rows = candidate
             break
-
     if not rows and isinstance(usages, list):
         rows = usages
 
+    entries = []
     for row in rows:
         if not isinstance(row, dict):
             continue
-
-        # Determine timestamp
         ts = row.get("dateTime") or row.get("start") or row.get("timestamp")
         if not ts:
             continue
-
-        # Try to derive per-unit price from cost ÷ usage
-        usage = _coerce_float(row.get("totalUsage") or row.get("usage") or row.get("quantity"))
-        cost = _coerce_float(
+        usage = _to_float(row.get("totalUsage") or row.get("usage") or row.get("quantity"))
+        cost = _to_float(
             row.get("totalUsageCostInclVat")
             or row.get("totalCostInclVat")
             or row.get("costInclVat")
         )
         if usage and cost and usage > 0:
             entries.append({"start": ts, "price": round(cost / usage, 5)})
-        elif _coerce_float(row.get("priceInclVat")) is not None:
+        elif _to_float(row.get("priceInclVat")) is not None:
             entries.append({"start": ts, "price": round(row["priceInclVat"], 5)})
-
     return entries
 
 
@@ -405,8 +574,36 @@ def _price_at(prices: list[dict[str, Any]], iso_ts: str) -> float | None:
     return None
 
 
+def _iter_products(products: dict[str, Any]):
+    for key in ("products", "data", "items"):
+        candidate = products.get(key)
+        if isinstance(candidate, list):
+            return candidate
+    return products if isinstance(products, list) else []
+
+
+def _find_rate(product: dict[str, Any]) -> float | None:
+    for rates_key in ("rates", "productRates", "tariff"):
+        rates = product.get(rates_key)
+        if isinstance(rates, dict):
+            for price_key in ("priceInclVat", "price", "usagePriceInclVat", "variableRate"):
+                val = _to_float(rates.get(price_key))
+                if val is not None:
+                    return val
+        elif isinstance(rates, list):
+            for rate in rates:
+                if isinstance(rate, dict):
+                    for price_key in ("priceInclVat", "price", "usagePriceInclVat"):
+                        val = _to_float(rate.get(price_key))
+                        if val is not None:
+                            return val
+    return None
+
+
 def _extract_gas_price(products: dict[str, Any]) -> float | None:
     for product in _iter_products(products):
+        if not isinstance(product, dict):
+            continue
         commodity = (product.get("commodity") or product.get("type") or "").lower()
         if "gas" in commodity:
             return _find_rate(product)
@@ -415,42 +612,23 @@ def _extract_gas_price(products: dict[str, Any]) -> float | None:
 
 def _extract_electricity_price(products: dict[str, Any]) -> float | None:
     for product in _iter_products(products):
+        if not isinstance(product, dict):
+            continue
         commodity = (product.get("commodity") or product.get("type") or "").lower()
         if "electricity" in commodity or "stroom" in commodity or "elektr" in commodity:
             return _find_rate(product)
     return None
 
 
-def _iter_products(products: dict[str, Any]):
-    for key in ("products", "data", "items"):
-        candidate = products.get(key)
-        if isinstance(candidate, list):
-            return candidate
-    if isinstance(products, list):
-        return products
-    return []
-
-
-def _find_rate(product: dict[str, Any]) -> float | None:
-    for rates_key in ("rates", "productRates", "tariff"):
-        rates = product.get(rates_key)
-        if isinstance(rates, dict):
-            for price_key in ("priceInclVat", "price", "usagePriceInclVat", "variableRate"):
-                val = _coerce_float(rates.get(price_key))
-                if val is not None:
-                    return val
-        elif isinstance(rates, list):
-            for rate in rates:
-                if isinstance(rate, dict):
-                    for price_key in ("priceInclVat", "price", "usagePriceInclVat"):
-                        val = _coerce_float(rate.get(price_key))
-                        if val is not None:
-                            return val
-    return None
-
-
-def _coerce_float(value: Any) -> float | None:
+def _to_float(value: Any) -> float | None:
     try:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _unescape_okta_string(s: str) -> str:
+    """Decode escape sequences Okta embeds in HTML-inlined JSON (e.g. \\x2D → -)."""
+    # Simple hex escape replacement; avoids full unicode_escape codec pitfalls
+    import re as _re
+    return _re.sub(r"\\x([0-9a-fA-F]{2})", lambda m: chr(int(m.group(1), 16)), s)

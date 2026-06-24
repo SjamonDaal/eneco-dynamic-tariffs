@@ -8,10 +8,18 @@
           "username": "E-mailadres",
           "password": "Wachtwoord"
         }
+      },
+      "totp": {
+        "title": "E-mailverificatie",
+        "description": "Eneco heeft een eenmalige code gestuurd naar {email}. Voer deze hieronder in.",
+        "data": {
+          "totp_code": "Verificatiecode"
+        }
       }
     },
     "error": {
       "invalid_auth": "Ongeldige inloggegevens. Controleer je e-mailadres en wachtwoord.",
+      "invalid_totp": "Onjuiste of verlopen verificatiecode. Probeer het opnieuw.",
       "cannot_connect": "Kan geen verbinding maken met Eneco. Probeer het later opnieuw."
     },
     "abort": {

@@ -8,10 +8,18 @@
           "username": "Email address",
           "password": "Password"
         }
+      },
+      "totp": {
+        "title": "Email verification",
+        "description": "Eneco sent a one-time code to {email}. Enter it below.",
+        "data": {
+          "totp_code": "Verification code"
+        }
       }
     },
     "error": {
-      "invalid_auth": "Invalid credentials. Check your email and password.",
+      "invalid_auth": "Invalid credentials. Check your email address and password.",
+      "invalid_totp": "Incorrect or expired verification code. Please try again.",
       "cannot_connect": "Unable to connect to Eneco. Please try again later."
     },
     "abort": {

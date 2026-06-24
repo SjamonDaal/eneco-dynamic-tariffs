@@ -6,17 +6,22 @@ from typing import Any
 import voluptuous as vol
 from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
-from homeassistant.exceptions import HomeAssistantError
 
-from .const import DOMAIN
-from .coordinator import EnecoApiClient, EnecoAuthError
+from .const import CONF_SESSION_COOKIES, DOMAIN
+from .coordinator import EnecoApiClient, EnecoAuthError, EnecoTotpRequired
 
 _LOGGER = logging.getLogger(__name__)
 
-STEP_USER_DATA_SCHEMA = vol.Schema(
+STEP_USER_SCHEMA = vol.Schema(
     {
         vol.Required(CONF_USERNAME): str,
         vol.Required(CONF_PASSWORD): str,
+    }
+)
+
+STEP_TOTP_SCHEMA = vol.Schema(
+    {
+        vol.Required("totp_code"): str,
     }
 )
 
@@ -25,6 +30,11 @@ class EnecoConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle the Eneco Dynamic Tariffs config flow."""
 
     VERSION = 1
+
+    def __init__(self) -> None:
+        self._client: EnecoApiClient | None = None
+        self._username: str = ""
+        self._password: str = ""
 
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
@@ -38,28 +48,68 @@ class EnecoConfigFlow(ConfigFlow, domain=DOMAIN):
             await self.async_set_unique_id(username.lower())
             self._abort_if_unique_id_configured()
 
-            client = EnecoApiClient()
+            self._client = EnecoApiClient()
+            self._username = username
+            self._password = password
+
             try:
-                await client.authenticate(username, password)
+                await self._client.authenticate(username, password)
+            except EnecoTotpRequired:
+                # Okta sent an email code — ask the user for it
+                return await self.async_step_totp()
             except EnecoAuthError as err:
-                _LOGGER.warning("Eneco authentication failed during setup: %s", err)
+                _LOGGER.warning("Eneco authentication failed: %s", err)
                 errors["base"] = "invalid_auth"
+                await self._client.close()
+                self._client = None
             except Exception:
                 _LOGGER.exception("Unexpected error during Eneco authentication")
                 errors["base"] = "cannot_connect"
+                if self._client:
+                    await self._client.close()
+                    self._client = None
             else:
-                return self.async_create_entry(
-                    title=f"Eneco ({username})",
-                    data={
-                        CONF_USERNAME: username,
-                        CONF_PASSWORD: password,
-                    },
-                )
-            finally:
-                await client.close()
+                return await self._create_entry()
 
         return self.async_show_form(
             step_id="user",
-            data_schema=STEP_USER_DATA_SCHEMA,
+            data_schema=STEP_USER_SCHEMA,
             errors=errors,
+        )
+
+    async def async_step_totp(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Ask the user for the one-time code that Eneco sent by email."""
+        errors: dict[str, str] = {}
+
+        if user_input is not None:
+            code = user_input["totp_code"].strip()
+            try:
+                await self._client.complete_totp(code)  # type: ignore[union-attr]
+            except EnecoAuthError as err:
+                _LOGGER.warning("Eneco TOTP verification failed: %s", err)
+                errors["base"] = "invalid_totp"
+            except Exception:
+                _LOGGER.exception("Unexpected error during Eneco TOTP verification")
+                errors["base"] = "cannot_connect"
+            else:
+                return await self._create_entry()
+
+        return self.async_show_form(
+            step_id="totp",
+            data_schema=STEP_TOTP_SCHEMA,
+            errors=errors,
+            description_placeholders={"email": self._username},
+        )
+
+    async def _create_entry(self) -> ConfigFlowResult:
+        cookies = self._client.get_session_cookies() if self._client else []  # type: ignore[union-attr]
+        return self.async_create_entry(
+            title=f"Eneco ({self._username})",
+            data={
+                CONF_USERNAME: self._username,
+                CONF_PASSWORD: self._password,
+                CONF_SESSION_COOKIES: cookies,
+            },
         )
