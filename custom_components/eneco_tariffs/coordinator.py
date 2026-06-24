@@ -163,13 +163,28 @@ class EnecoApiClient:
         password_submitted = False
 
         for i in range(15):
-            _LOGGER.debug("IDX step %d — keys: %s", i, list(state.keys()))
-            _LOGGER.debug("IDX step %d — full state: %s", i, state)
+            remediation_names = [
+                r.get("name") for r in state.get("remediation", {}).get("value", [])
+            ]
+            _LOGGER.warning(
+                "Eneco IDX step %d — top-level keys: %s | remediations: %s",
+                i,
+                list(state.keys()),
+                remediation_names,
+            )
+            # Log field names inside each form (without values, to avoid leaking secrets)
+            for rem in state.get("remediation", {}).get("value", []):
+                field_names = [f.get("name") for f in rem.get("value", [])]
+                _LOGGER.warning(
+                    "  form '%s' href=%s fields=%s",
+                    rem.get("name"),
+                    rem.get("href"),
+                    field_names,
+                )
 
             if "success" in state:
                 return state
 
-            # Log any inline messages (e.g. wrong password)
             for msg in state.get("messages", {}).get("value", []):
                 _LOGGER.warning("Okta message: %s", msg.get("message", msg))
 
@@ -182,7 +197,6 @@ class EnecoApiClient:
             form = remediations[0]
             form_name = form.get("name", "")
             href = form.get("href")
-            _LOGGER.debug("IDX step %d — form '%s' → %s", i, form_name, href)
 
             if not href:
                 raise EnecoAuthError(f"Okta form '{form_name}' has no action URL")
@@ -198,8 +212,8 @@ class EnecoApiClient:
                     post[name] = username
                 elif name == "credentials" and is_secret:
                     if password_submitted:
-                        # A second credentials challenge is the email TOTP step
-                        _LOGGER.debug("IDX — email TOTP challenge detected at step %d", i)
+                        # A second credentials challenge after password = email TOTP
+                        _LOGGER.warning("Eneco IDX — email TOTP challenge detected at step %d", i)
                         totp_needed = True
                         break
                     post[name] = {"passcode": password}
@@ -224,10 +238,19 @@ class EnecoApiClient:
                 self._pending_totp_state = state
                 raise EnecoTotpRequired()
 
-            _LOGGER.debug("IDX step %d — posting keys: %s", i, list(post.keys()))
+            _LOGGER.warning(
+                "Eneco IDX step %d — posting to %s with keys: %s",
+                i,
+                href,
+                list(post.keys()),
+            )
             state = await self._post_json(session, href, post)
 
-        raise EnecoAuthError("Okta IDX loop exceeded maximum iterations")
+        raise EnecoAuthError(
+            f"Okta IDX loop exceeded maximum iterations. "
+            f"Last state keys: {list(state.keys())} | "
+            f"Last remediations: {[r.get('name') for r in state.get('remediation', {}).get('value', [])]}"
+        )
 
     async def _finalise_auth(
         self, session: aiohttp.ClientSession, state: dict[str, Any]
