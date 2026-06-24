@@ -244,11 +244,42 @@ async def main() -> None:
             print(f"  url: {url}")
             async with session.get(url, headers=headers) as resp:
                 print(f"  status: {resp.status}")
-                if resp.status == 200:
-                    data = await resp.json(content_type=None)
-                    print(json.dumps(data, indent=2, default=str))
-                else:
+                if resp.status != 200:
                     print(f"  body: {await resp.text()}")
+                    continue
+                data = await resp.json(content_type=None)
+
+            # Show top-level keys
+            print(f"  top-level keys: {list(data.keys())}")
+
+            # Find the list of entries (try common key names)
+            rows = None
+            for key in ("data", "usages", "measurements", "values", "items"):
+                candidate = data.get(key)
+                if isinstance(candidate, list):
+                    rows = candidate
+                    print(f"  entries found under '{key}': {len(rows)} items")
+                    break
+            if rows is None:
+                print("  no list of entries found — full response:")
+                print(json.dumps(data, indent=2, default=str))
+                continue
+
+            # First entry — show full structure to understand available fields
+            if rows:
+                print(f"\n  --- First entry (full structure) ---")
+                print(json.dumps(rows[0], indent=4, default=str))
+
+            # Condensed table: timestamp + cost/usage fields for every entry
+            print(f"\n  --- All entries (condensed) ---")
+            print(f"  {'timestamp':<30} {'fields with values'}")
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                ts = row.get("dateTime") or row.get("start") or row.get("timestamp") or "?"
+                # Show only non-null numeric fields
+                numeric = {k: v for k, v in row.items() if isinstance(v, (int, float)) and v != 0}
+                print(f"  {str(ts):<30} {numeric}")
 
         section("✓ Done")
 
