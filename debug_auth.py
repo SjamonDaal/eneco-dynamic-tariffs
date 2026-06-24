@@ -230,6 +230,26 @@ async def main() -> None:
             data = await resp.json(content_type=None)
             print(json.dumps(data, indent=2, default=str))
 
+        from datetime import date, timedelta
+        today = date.today().isoformat()
+        tomorrow = (date.today() + timedelta(days=1)).isoformat()
+
+        for label, start in [("today", today), ("tomorrow", tomorrow)]:
+            section(f"9  Test usages endpoint ({label}: {start})")
+            params = f"aggregation=Day&interval=Hour&start={start}&addBudget=false&addWeather=false&extrapolate=false"
+            url = (
+                f"{API_BASE}/dxpweb/nl/eneco/customers/{customer_id}"
+                f"/accounts/{account_id}/usages?{params}"
+            )
+            print(f"  url: {url}")
+            async with session.get(url, headers=headers) as resp:
+                print(f"  status: {resp.status}")
+                if resp.status == 200:
+                    data = await resp.json(content_type=None)
+                    print(json.dumps(data, indent=2, default=str))
+                else:
+                    print(f"  body: {await resp.text()}")
+
         section("✓ Done")
 
 

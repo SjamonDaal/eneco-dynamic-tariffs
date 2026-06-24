@@ -598,28 +598,37 @@ def _price_at(prices: list[dict[str, Any]], iso_ts: str) -> float | None:
 
 
 def _iter_products(products: dict[str, Any]):
-    for key in ("products", "data", "items"):
+    # Actual structure: {"data": {"products": [...]}}
+    data = products.get("data")
+    if isinstance(data, dict):
+        prods = data.get("products")
+        if isinstance(prods, list):
+            return prods
+    # Fallback for other possible structures
+    for key in ("products", "items"):
         candidate = products.get(key)
         if isinstance(candidate, list):
             return candidate
     return products if isinstance(products, list) else []
 
 
+def _product_type_name(product: dict[str, Any]) -> str:
+    """Return the normalised type name for a product dict."""
+    type_field = product.get("type", {})
+    if isinstance(type_field, dict):
+        return type_field.get("name", "").lower()
+    return str(type_field).lower()
+
+
 def _find_rate(product: dict[str, Any]) -> float | None:
-    for rates_key in ("rates", "productRates", "tariff"):
-        rates = product.get(rates_key)
-        if isinstance(rates, dict):
-            for price_key in ("priceInclVat", "price", "usagePriceInclVat", "variableRate"):
-                val = _to_float(rates.get(price_key))
+    # Actual structure: unitRates[].vatIncluded
+    unit_rates = product.get("unitRates", [])
+    if isinstance(unit_rates, list):
+        for rate in unit_rates:
+            if isinstance(rate, dict):
+                val = _to_float(rate.get("vatIncluded"))
                 if val is not None:
                     return val
-        elif isinstance(rates, list):
-            for rate in rates:
-                if isinstance(rate, dict):
-                    for price_key in ("priceInclVat", "price", "usagePriceInclVat"):
-                        val = _to_float(rate.get(price_key))
-                        if val is not None:
-                            return val
     return None
 
 
@@ -627,8 +636,7 @@ def _extract_gas_price(products: dict[str, Any]) -> float | None:
     for product in _iter_products(products):
         if not isinstance(product, dict):
             continue
-        commodity = (product.get("commodity") or product.get("type") or "").lower()
-        if "gas" in commodity:
+        if _product_type_name(product) == "gas":
             return _find_rate(product)
     return None
 
@@ -637,8 +645,7 @@ def _extract_electricity_price(products: dict[str, Any]) -> float | None:
     for product in _iter_products(products):
         if not isinstance(product, dict):
             continue
-        commodity = (product.get("commodity") or product.get("type") or "").lower()
-        if "electricity" in commodity or "stroom" in commodity or "elektr" in commodity:
+        if _product_type_name(product) == "electricity":
             return _find_rate(product)
     return None
 
