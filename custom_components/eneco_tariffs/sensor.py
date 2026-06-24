@@ -23,6 +23,7 @@ from .coordinator import EnecoCoordinator
 class EnecoSensorEntityDescription(SensorEntityDescription):
     data_key: str
     extra_attrs_key: str | None = None
+    rating_key: str | None = None
 
 
 SENSORS: tuple[EnecoSensorEntityDescription, ...] = (
@@ -35,6 +36,7 @@ SENSORS: tuple[EnecoSensorEntityDescription, ...] = (
         state_class=SensorStateClass.MEASUREMENT,
         icon="mdi:lightning-bolt",
         extra_attrs_key="electricity_prices_today",
+        rating_key="electricity_current_rating",
     ),
     EnecoSensorEntityDescription(
         key="electricity_next_price",
@@ -44,6 +46,7 @@ SENSORS: tuple[EnecoSensorEntityDescription, ...] = (
         device_class=SensorDeviceClass.MONETARY,
         state_class=SensorStateClass.MEASUREMENT,
         icon="mdi:lightning-bolt-outline",
+        rating_key="electricity_next_rating",
     ),
     EnecoSensorEntityDescription(
         key="electricity_rate",
@@ -116,10 +119,15 @@ class EnecoSensor(CoordinatorEntity[EnecoCoordinator], SensorEntity):
 
     @property
     def extra_state_attributes(self) -> dict[str, Any] | None:
-        attrs_key = self.entity_description.extra_attrs_key
-        if not attrs_key or self.coordinator.data is None:
+        if self.coordinator.data is None:
             return None
-        prices = self.coordinator.data.get(attrs_key)
-        if prices:
-            return {"prices": prices}
-        return None
+        attrs: dict[str, Any] = {}
+        if self.entity_description.extra_attrs_key:
+            prices = self.coordinator.data.get(self.entity_description.extra_attrs_key)
+            if prices:
+                attrs["prices"] = prices
+        if self.entity_description.rating_key:
+            rating = self.coordinator.data.get(self.entity_description.rating_key)
+            if rating:
+                attrs["rating"] = rating
+        return attrs or None

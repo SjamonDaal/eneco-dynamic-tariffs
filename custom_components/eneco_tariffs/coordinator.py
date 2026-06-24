@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import aiohttp
@@ -19,6 +19,7 @@ from .const import (
     API_KEY,
     CONF_SESSION_COOKIES,
     DOMAIN,
+    DYNAMIC_PRICES_URL,
     ENECO_WEB_BASE,
     OKTA_BASE,
     UPDATE_INTERVAL_MINUTES,
@@ -388,13 +389,13 @@ class EnecoApiClient:
             resp.raise_for_status()
             return await resp.json(content_type=None)
 
-    async def get_insights(self) -> dict[str, Any]:
+    async def get_dynamic_prices(self, date: str) -> dict[str, Any]:
+        """Fetch all-in hourly prices (incl. VAT) for the given local date."""
         session = await self._get_session()
-        url = (
-            f"{API_BASE}/dxpweb/v2/nl/eneco/customers/{self._customer_id}"
-            f"/accounts/{self._account_id}/usages/services/insights"
-        )
-        async with session.get(url, headers=self._api_headers) as resp:
+        params = {"start": date, "interval": "Hour", "aggregation": "Day"}
+        async with session.get(
+            DYNAMIC_PRICES_URL, params=params, headers=self._api_headers
+        ) as resp:
             if resp.status == 401:
                 raise EnecoAuthError("API token rejected (401)")
             resp.raise_for_status()
@@ -496,35 +497,27 @@ class EnecoCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         try:
             raw["products"] = await self._client.get_products()
-            _LOGGER.debug("Eneco products: %s", raw["products"])
+            _LOGGER.debug("Eneco products fetched")
         except EnecoAuthError:
             raise
         except Exception as err:
             _LOGGER.warning("Failed to fetch Eneco products: %s", err)
 
         try:
-            raw["usages_today"] = await self._client.get_usages(today)
-            _LOGGER.debug("Eneco usages today: %s", raw["usages_today"])
+            raw["prices_today"] = await self._client.get_dynamic_prices(today)
+            _LOGGER.debug("Eneco dynamic prices (today) fetched")
         except EnecoAuthError:
             raise
         except Exception as err:
-            _LOGGER.warning("Failed to fetch Eneco usages (today): %s", err)
+            _LOGGER.warning("Failed to fetch Eneco dynamic prices (today): %s", err)
 
         try:
-            raw["usages_tomorrow"] = await self._client.get_usages(tomorrow)
-            _LOGGER.debug("Eneco usages tomorrow: %s", raw["usages_tomorrow"])
+            raw["prices_tomorrow"] = await self._client.get_dynamic_prices(tomorrow)
+            _LOGGER.debug("Eneco dynamic prices (tomorrow) fetched")
         except EnecoAuthError:
             raise
         except Exception as err:
-            _LOGGER.debug("No Eneco usage data for tomorrow yet: %s", err)
-
-        try:
-            raw["insights"] = await self._client.get_insights()
-            _LOGGER.debug("Eneco insights: %s", raw["insights"])
-        except EnecoAuthError:
-            raise
-        except Exception as err:
-            _LOGGER.warning("Failed to fetch Eneco insights: %s", err)
+            _LOGGER.debug("No Eneco dynamic prices for tomorrow yet: %s", err)
 
         return _parse_tariff_data(raw)
 
@@ -539,61 +532,67 @@ class EnecoCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
 
 def _parse_tariff_data(raw: dict[str, Any]) -> dict[str, Any]:
-    now = datetime.now().astimezone()
-    current_hour = now.replace(minute=0, second=0, microsecond=0)
-    next_hour = current_hour + timedelta(hours=1)
+    now_utc = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+    next_utc = now_utc + timedelta(hours=1)
 
-    prices_today = _extract_hourly_prices(raw.get("usages_today", {}))
-    prices_tomorrow = _extract_hourly_prices(raw.get("usages_tomorrow", {}))
+    prices_today = _extract_dynamic_prices(raw.get("prices_today", {}), "electricity")
+    prices_tomorrow = _extract_dynamic_prices(raw.get("prices_tomorrow", {}), "electricity")
+    all_prices = prices_today + prices_tomorrow
+
+    current_entry = _price_entry_at(all_prices, now_utc)
+    next_entry = _price_entry_at(all_prices, next_utc)
+
+    # Gas changes daily — grab the first slice's price
+    gas_slices = _extract_dynamic_prices(raw.get("prices_today", {}), "gas")
+    gas_price = gas_slices[0]["price"] if gas_slices else _extract_gas_price(raw.get("products", {}))
 
     return {
-        "electricity_current_price": _price_at(prices_today, current_hour.isoformat()),
-        "electricity_next_price": (
-            _price_at(prices_today, next_hour.isoformat())
-            or _price_at(prices_tomorrow, next_hour.isoformat())
-        ),
+        "electricity_current_price": current_entry["price"] if current_entry else None,
+        "electricity_current_rating": current_entry.get("rating") if current_entry else None,
+        "electricity_next_price": next_entry["price"] if next_entry else None,
+        "electricity_next_rating": next_entry.get("rating") if next_entry else None,
         "electricity_rate": _extract_electricity_price(raw.get("products", {})),
-        "gas_current_price": _extract_gas_price(raw.get("products", {})),
+        "gas_current_price": gas_price,
         "electricity_prices_today": prices_today,
         "electricity_prices_tomorrow": prices_tomorrow,
-        "raw": raw,
     }
 
 
-def _extract_hourly_prices(usages: dict[str, Any]) -> list[dict[str, Any]]:
-    rows: list[Any] = []
-    for key in ("data", "usages", "measurements", "values", "items"):
-        candidate = usages.get(key)
-        if isinstance(candidate, list):
-            rows = candidate
-            break
-    if not rows and isinstance(usages, list):
-        rows = usages
+def _extract_dynamic_prices(
+    data: dict[str, Any], product_type: str = "electricity"
+) -> list[dict[str, Any]]:
+    """Parse slices from the /dxpweb/public/nl/eneco/dynamic/prices endpoint.
 
-    entries = []
-    for row in rows:
-        if not isinstance(row, dict):
+    Structure: data.products[{productType}].slices[].{start, price.total, price.rating}
+    Timestamps are UTC (trailing 'Z').
+    """
+    for product in data.get("data", {}).get("products", []):
+        if product.get("productType") != product_type:
             continue
-        ts = row.get("dateTime") or row.get("start") or row.get("timestamp")
-        if not ts:
-            continue
-        usage = _to_float(row.get("totalUsage") or row.get("usage") or row.get("quantity"))
-        cost = _to_float(
-            row.get("totalUsageCostInclVat")
-            or row.get("totalCostInclVat")
-            or row.get("costInclVat")
-        )
-        if usage and cost and usage > 0:
-            entries.append({"start": ts, "price": round(cost / usage, 5)})
-        elif _to_float(row.get("priceInclVat")) is not None:
-            entries.append({"start": ts, "price": round(row["priceInclVat"], 5)})
-    return entries
+        entries = []
+        for slice_ in product.get("slices", []):
+            ts = slice_.get("start")
+            price_obj = slice_.get("price", {})
+            price = _to_float(price_obj.get("total"))
+            rating = price_obj.get("rating", "average")
+            if ts and price is not None:
+                entries.append({"start": ts, "price": round(price, 7), "rating": rating})
+        return entries
+    return []
 
 
-def _price_at(prices: list[dict[str, Any]], iso_ts: str) -> float | None:
+def _price_entry_at(
+    prices: list[dict[str, Any]], dt_utc: datetime
+) -> dict[str, Any] | None:
+    """Return the price entry whose UTC hour matches dt_utc."""
     for entry in prices:
-        if entry.get("start", "").startswith(iso_ts[:16]):
-            return entry["price"]
+        ts = entry.get("start", "")
+        try:
+            entry_dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            if entry_dt == dt_utc:
+                return entry
+        except ValueError:
+            continue
     return None
 
 

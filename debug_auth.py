@@ -281,6 +281,61 @@ async def main() -> None:
                 numeric = {k: v for k, v in row.items() if isinstance(v, (int, float)) and v != 0}
                 print(f"  {str(ts):<30} {numeric}")
 
+        section("10  Dynamic prices endpoint (today + tomorrow)")
+        for label, start in [("today", today), ("tomorrow", tomorrow)]:
+            dyn_url = f"{API_BASE}/dxpweb/public/nl/eneco/dynamic/prices?start={start}&interval=Hour&aggregation=Day"
+            print(f"\n--- {label} ({start}) ---")
+            async with session.get(dyn_url, headers=headers) as resp:
+                print(f"  status: {resp.status}")
+                if resp.status != 200:
+                    print(f"  body: {await resp.text()}")
+                    continue
+                dyn = await resp.json(content_type=None)
+
+            for product in dyn.get("data", {}).get("products", []):
+                ptype = product.get("productType")
+                slices = product.get("slices", [])
+                print(f"  {ptype}: {len(slices)} slices, avg={product.get('averagePrice')}")
+                for s in slices:
+                    p = s.get("price", {})
+                    print(f"    {s.get('start')}  total={p.get('total')}  rating={p.get('rating')}")
+
+        section("12  Usages with extrapolate=true (today + tomorrow)")
+        for label, start in [("today", today), ("tomorrow", tomorrow)]:
+            print(f"\n--- {label} ({start}) ---")
+            ext_url = (
+                f"{API_BASE}/dxpweb/nl/eneco/customers/{customer_id}"
+                f"/accounts/{account_id}/usages?aggregation=Day&interval=Hour"
+                f"&start={start}&addBudget=false&addWeather=false&extrapolate=true"
+            )
+            async with session.get(ext_url, headers=headers) as resp:
+                print(f"  status: {resp.status}")
+                if resp.status != 200:
+                    print(f"  body: {await resp.text()}")
+                    continue
+                ext_data = await resp.json(content_type=None)
+
+            periods = ext_data.get("data", {}).get("usages", [])
+            for period in periods:
+                entries = period.get("entries", [])
+                print(f"  period {period.get('period')}: {len(entries)} entries")
+                if entries:
+                    print("  First entry:")
+                    print(json.dumps(entries[0], indent=4, default=str))
+                print("\n  Condensed (ts | status | high | low | highCostInclVat | lowCostInclVat | usedProductRates):")
+                for e in entries:
+                    a = e.get("actual", {})
+                    el = a.get("electricity", {})
+                    rates = el.get("usedProductRates", [])
+                    rate_str = json.dumps(rates[0]) if rates else "[]"
+                    print(
+                        f"    {a.get('date','?')[:16]}  "
+                        f"status={el.get('status','?'):15s}  "
+                        f"high={el.get('high',0):.4f}  low={el.get('low',0):.4f}  "
+                        f"highCost={el.get('highCostInclVat',0):.5f}  lowCost={el.get('lowCostInclVat',0):.5f}  "
+                        f"rates={rate_str}"
+                    )
+
         section("✓ Done")
 
 
