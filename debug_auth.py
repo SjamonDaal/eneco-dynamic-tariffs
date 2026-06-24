@@ -149,7 +149,7 @@ async def main() -> None:
 
                 if name == "identifier":
                     post[name] = username
-                elif name == "credentials" and is_secret:
+                elif name == "credentials":
                     if password_submitted:
                         totp_needed = True
                         break
