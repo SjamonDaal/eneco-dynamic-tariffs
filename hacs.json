@@ -2,5 +2,5 @@
   "name": "Eneco Dynamic Tariffs",
   "content_in_root": false,
   "iot_class": "cloud_polling",
-  "homeassistant": "2024.1.0"
+  "homeassistant": "2026.1.0"
 }
