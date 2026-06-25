@@ -444,7 +444,15 @@ class EnecoCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         except EnecoAuthError as err:
             self._authenticated = False
-            _LOGGER.debug("Auth error, retrying: %s", err)
+            _LOGGER.debug("Auth error, retrying with fresh client: %s", err)
+            await self._client.close()
+            self._client = EnecoApiClient()
+            # Remove stored cookies so the retry does a full auth rather than
+            # restoring the same stale session that just produced the 401
+            self.hass.config_entries.async_update_entry(
+                self.entry,
+                data={k: v for k, v in self.entry.data.items() if k != CONF_SESSION_COOKIES},
+            )
             try:
                 await self._authenticate()
                 return await self._fetch_data()
