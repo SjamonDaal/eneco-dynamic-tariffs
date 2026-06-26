@@ -48,7 +48,10 @@ class EnecoApiClient:
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession(cookie_jar=aiohttp.CookieJar())
+            self._session = aiohttp.ClientSession(
+                cookie_jar=aiohttp.CookieJar(),
+                timeout=aiohttp.ClientTimeout(total=30, connect=10),
+            )
         return self._session
 
     async def close(self) -> None:
